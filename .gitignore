@@ -1,0 +1,8 @@
+.pio/
+.pio-core/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Base de compilacion generada con rutas locales
+compile_commands.json

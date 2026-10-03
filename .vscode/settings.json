@@ -1,0 +1,9 @@
+{
+  "sonarlint.pathToCompileCommands": "/Volumes/ssd-externo/02-Documentos/Seguidor_linea /firmware/compile_commands.json",
+  // Reglas no aplicables a firmware AVR: no hay STL (std::array/std::string)
+  // y setup()/loop() requieren estado global mutable.
+  "sonarlint.rules": {
+    "cpp:S5945": { "level": "off" },
+    "cpp:S5421": { "level": "off" }
+  }
+}

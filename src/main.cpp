@@ -9,7 +9,8 @@
 
 namespace {
 using namespace Config;
-enum class State : uint8_t { Locked, Diagnostic, Color, Calibration, Speed, Running, Stopped };
+enum class State : uint8_t { Locked, Diagnostic, Ready, Countdown, Color, Calibration, Speed, Running, Stopped };
+enum class Gesture : uint8_t { None, Single, Both };
 enum class Reason : uint8_t { Request, LineLost, RunLimit, Session };
 
 // Parametros ajustables por serie; "save" los guarda en EEPROM.
@@ -88,6 +89,15 @@ uint32_t runAt;
 uint32_t tickAt;
 uint32_t lastSeen;
 uint32_t reportAt;
+uint32_t calFailAt;     // Momento del ultimo intento de calibracion fallido.
+bool calFailed = false;
+bool autoMode = false; // Modo botones: sin GO y sin menu.
+bool gestureHeld = false;
+bool gestureBoth = false;
+bool gestureSkip = false; // Ignorar el gesto de la pulsacion que detuvo la carrera.
+bool calibrated = false;
+bool viewBar = true;    // Imprimir lo que ve la barra de sensores.
+uint32_t viewAt;
 char command[24];
 uint8_t commandLength = 0;
 
@@ -106,6 +116,19 @@ struct Button {
 };
 Button b1;
 Button b2;
+// Gesto completo al soltar todos los botones: uno solo o los dos a la vez en algun momento.
+Gesture readGesture() {
+  if (b1.stable || b2.stable) {
+    gestureHeld = true;
+    if (b1.stable && b2.stable) gestureBoth = true;
+    return Gesture::None;
+  }
+  if (!gestureHeld) return Gesture::None;
+  const Gesture g = gestureBoth ? Gesture::Both : Gesture::Single;
+  gestureHeld = gestureBoth = false;
+  if (gestureSkip) { gestureSkip = false; return Gesture::None; }
+  return g;
+}
 
 // ===== Parametros =====
 void applyParams() {
@@ -209,7 +232,7 @@ void dumpTelemetry() {
 // ===== Consola serie (fuera de carrera) =====
 void printHelp() {
   Serial.println(F("Comandos: kp <x> | kd <x> | v <pwm> | turbo <pwm> | succion <pwm> | save | defaults"));
-  Serial.println(F("          r (resumen) | d (telemetria CSV) | ?"));
+  Serial.println(F("          r (resumen) | d (telemetria CSV) | ver (barra de sensores) | ?"));
   printParams(params);
 }
 // Ajusta un parametro; devuelve false si el comando no es de ajuste.
@@ -237,6 +260,7 @@ void handleCommand(char *text) {
   else if (!strcmp(text, "save")) { EEPROM.put(PARAMS_ADDR, params); Serial.println(F("Parametros guardados.")); return; }
   else if (!strcmp(text, "r")) { printSummary(); return; }
   else if (!strcmp(text, "d")) { dumpTelemetry(); return; }
+  else if (!strcmp(text, "ver")) { viewBar = !viewBar; return; }
   else { printHelp(); return; }
   printParams(params);
 }
@@ -282,7 +306,9 @@ void calibrateStart(bool black, uint32_t now) {
   for (uint8_t i = 0; i < SENSOR_COUNT; ++i) { low[i] = 255; high[i] = 0; }
   state = State::Calibration;
   stateAt = now;
-  Serial.println(F("Mueve manualmente toda la barra sobre linea y fondo. Pulsa para terminar."));
+  calFailed = false;
+  Serial.println(autoMode ? F("Calibracion: mover toda la barra sobre linea y fondo. SW1+SW2 para salir.")
+                          : F("Mueve manualmente toda la barra sobre linea y fondo. Pulsa para terminar."));
 }
 // Promedio de 4 barridos para que el ruido no ensanche el minimo/maximo de calibracion.
 void readAveraged() {
@@ -293,15 +319,27 @@ void readAveraged() {
   }
   for (uint8_t i = 0; i < SENSOR_COUNT; ++i) raw[i] = static_cast<uint8_t>(sum[i] / 4);
 }
+void trackMinMax() {
+  readAveraged();
+  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
+    low[i] = min(low[i], raw[i]);
+    high[i] = max(high[i], raw[i]);
+  }
+}
 // Error en milesimas de sensor: -7500 (sensor 0, izquierda) .. 7500 (sensor 15).
+// Cuanto ve la linea un sensor: 0 (fondo) .. 1000 (linea), segun la calibracion.
+uint16_t lineValue(uint8_t i) {
+  uint16_t value = 0;
+  if (raw[i] > low[i]) value = static_cast<uint16_t>(min(uint32_t(raw[i] - low[i]) * scale[i] >> 8, 1000UL));
+  if (blackLine != Hardware::BLACK_IS_HIGH) value = 1000 - value;
+  return value;
+}
 bool position(int16_t &error) {
   uint32_t sum = 0;
   uint32_t weighted = 0;
   uint16_t peak = 0;
   for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
-    uint16_t value = 0;
-    if (raw[i] > low[i]) value = static_cast<uint16_t>(min(uint32_t(raw[i] - low[i]) * scale[i] >> 8, 1000UL));
-    if (blackLine != Hardware::BLACK_IS_HIGH) value = 1000 - value;
+    uint16_t value = lineValue(i);
     if (value > peak) peak = value;
     if (value < 150) value = 0;
     sum += value;
@@ -327,8 +365,9 @@ void startRun(uint32_t now, int16_t initial) {
   Hardware::leds(true, true, true);
 }
 void updateRunSuction(uint32_t elapsed) {
-  if (elapsed >= RUN_SUCTION_RAMP_MS) { setSuction(params.suction); return; }
-  const int32_t delta = int32_t(params.suction) - suctionFrom;
+  const uint8_t target = autoMode && !AUTO_SUCTION ? 0 : params.suction;
+  if (elapsed >= RUN_SUCTION_RAMP_MS) { setSuction(target); return; }
+  const int32_t delta = int32_t(target) - suctionFrom;
   setSuction(static_cast<uint8_t>(suctionFrom + delta * int32_t(elapsed) / int32_t(RUN_SUCTION_RAMP_MS)));
 }
 // Fuera de linea: girar hacia el lado por donde salio; exterior a fondo, interior frena.
@@ -409,6 +448,30 @@ void follow(uint32_t now) {
   if (loopUs > stats.maxLoopUs) stats.maxLoopUs = static_cast<uint16_t>(loopUs);
 }
 
+// ===== Vista de la barra =====
+// Calibrado: [..##....] con # = linea, + = borde, . = fondo, y el error.
+// Sin calibrar: valores ADC crudos. En carrera no bloquea: omite la linea si el buffer esta lleno.
+void printBar(uint32_t now) {
+  if (!viewBar || state == State::Diagnostic || now - viewAt < VIEW_MS) return;
+  if (state == State::Running && Serial.availableForWrite() < 32) return;
+  viewAt = now;
+  if (state != State::Running) Hardware::readSensors(raw);
+  if (!calibrated) {
+    for (const uint8_t value : raw) { Serial.print(value); Serial.print(' '); }
+    Serial.println(F("(sin calibrar)"));
+    return;
+  }
+  Serial.print('[');
+  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
+    const uint16_t value = lineValue(i);
+    Serial.print(value >= 500 ? '#' : value >= 150 ? '+' : '.');
+  }
+  Serial.print(F("] "));
+  int16_t error;
+  if (position(error)) { Serial.print(F("e=")); Serial.println(error); }
+  else Serial.println(F("sin linea"));
+}
+
 // ===== Diagnostico =====
 void motorTest() {
   Serial.println(F("Prueba de motores: ruedas en el aire. Izq +, izq -, der +, der -."));
@@ -438,32 +501,116 @@ void diagnostic(uint32_t now, bool p1, bool p2) {
 }
 
 // ===== Estados =====
-// Valida el contraste de cada sensor y precalcula su escala; false si alguno no alcanza.
+// Imprime min/max/contraste de cada sensor, valida el contraste y precalcula su escala.
 bool finishCalibration() {
   bool valid = true;
+  Serial.println(F("Sensor  min  max  contraste"));
   for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
     const auto contrast = static_cast<uint8_t>(high[i] - low[i]);
-    if (contrast >= MIN_CONTRAST) {
-      scale[i] = static_cast<uint16_t>(256000UL / contrast);
-      continue;
-    }
-    valid = false;
-    Serial.print(F("Sensor ")); Serial.print(i); Serial.print(F(" contraste ")); Serial.println(contrast);
+    const bool ok = high[i] >= low[i] && contrast >= MIN_CONTRAST;
+    Serial.print(F("  ")); Serial.print(i);
+    Serial.print(F("     ")); Serial.print(low[i]);
+    Serial.print(F("  ")); Serial.print(high[i]);
+    Serial.print(F("  ")); Serial.print(high[i] >= low[i] ? contrast : 0);
+    Serial.println(ok ? F("  OK") : F("  BAJO"));
+    if (ok) scale[i] = static_cast<uint16_t>(256000UL / contrast);
+    else valid = false;
   }
-  if (!valid) Serial.println(F("Contraste insuficiente: pasar TODOS los sensores sobre linea y fondo."));
+  calibrated = valid;
+  if (valid) Serial.println(F("Calibracion correcta."));
+  else Serial.println(F("Contraste insuficiente: pasar TODOS los sensores sobre linea y fondo y pulsar otra vez."));
   return valid;
 }
+void enterReady(uint32_t now);
 void handleCalibration(uint32_t now, bool pressed) {
-  const bool blink = (now / 200) % 2;
-  Hardware::leds(blackLine && blink, blackLine && blink, !blackLine && blink);
-  readAveraged();
-  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
-    low[i] = min(low[i], raw[i]);
-    high[i] = max(high[i], raw[i]);
+  if (calFailed && now - calFailAt < 1000) {
+    // Calibracion fallida: los tres LEDs parpadean rapido durante 1 s.
+    const bool fast = (now / 50) % 2;
+    Hardware::leds(fast, fast, fast);
+  } else {
+    calFailed = false;
+    const bool blink = (now / 200) % 2;
+    Hardware::leds(blackLine && blink, blackLine && blink, !blackLine && blink);
   }
-  if (!pressed || now - stateAt < 500 || !finishCalibration()) return;
+  trackMinMax();
+  if (!pressed || now - stateAt < 500) return;
+  if (!finishCalibration()) {
+    calFailed = true;
+    calFailAt = now;
+    if (!autoMode) return;
+    Serial.println(F("Se calibrara quieto sobre la linea al arrancar."));
+  }
   Hardware::leds(false, false, false);
-  enterSpeed();
+  if (autoMode) enterReady(now);
+  else enterSpeed();
+}
+void enterReady(uint32_t now) {
+  Hardware::disable();
+  blackLine = AUTO_BLACK_LINE;
+  if (!suctionPwm) rampAt = now;
+  state = State::Ready;
+  Serial.println(F("Listo. SW1 o SW2: arrancar. SW1+SW2: calibrar."));
+}
+// Calibracion sin giro: con el robot quieto sobre la linea, unos sensores ven linea y otros
+// fondo. El minimo y el maximo de toda la barra se usan como referencia comun.
+bool calibrateOnLine() {
+  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) { low[i] = 255; high[i] = 0; }
+  for (uint8_t n = 0; n < 8; ++n) trackMinMax();
+  uint8_t lo = 255;
+  uint8_t hi = 0;
+  Serial.print(F("Lectura: "));
+  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
+    Serial.print(raw[i]); Serial.print(' ');
+    lo = min(lo, low[i]);
+    hi = max(hi, high[i]);
+  }
+  Serial.println();
+  for (uint8_t i = 0; i < SENSOR_COUNT; ++i) { low[i] = lo; high[i] = hi; }
+  return finishCalibration();
+}
+// La succion sube desde el encendido y sigue activa mientras espera el arranque.
+void spinSuction(uint32_t now) {
+  const uint8_t target = AUTO_SUCTION ? params.suction : 0;
+  const uint32_t t = now - rampAt;
+  setSuction(t >= SUCTION_RAMP_MS ? target : static_cast<uint8_t>(t * target / SUCTION_RAMP_MS));
+}
+void handleReady(uint32_t now, Gesture g) {
+  spinSuction(now);
+  if (g == Gesture::Both) { setSuction(0); calibrateStart(AUTO_BLACK_LINE, now); return; }
+  if (g == Gesture::Single) {
+    state = State::Countdown;
+    stateAt = now;
+    Serial.println(F("Arranque en 1 s. Boton cancela."));
+    return;
+  }
+  // Tras un intento fallido, los tres LEDs parpadean rapido 1 s; si no, lento.
+  const bool blink = calFailed && now - calFailAt < 1000 ? (now / 50) % 2 : (now / 500) % 2;
+  Hardware::leds(blink, blink, blink);
+}
+void handleCountdown(uint32_t now, bool pressed) {
+  spinSuction(now);
+  if (pressed) {
+    gestureSkip = true;
+    Serial.println(F("Arranque cancelado."));
+    enterReady(now);
+    return;
+  }
+  const bool fast = (now / 100) % 2;
+  Hardware::leds(fast, fast, fast);
+  if (now - stateAt < START_DELAY_MS) return;
+  int16_t initial = 0;
+  bool online;
+  if (calibrated) { readAveraged(); online = position(initial); }
+  else online = calibrateOnLine() && position(initial);
+  if (!online) {
+    Serial.println(F("No se ve la linea: centrar el robot y pulsar otra vez."));
+    calFailed = true;
+    calFailAt = now;
+    enterReady(now);
+    return;
+  }
+  calFailed = false;
+  startRun(now, initial);
 }
 void updateReadySuction(uint32_t now) {
   if (!Hardware::ready()) {
@@ -493,11 +640,12 @@ void handleSpeed(uint32_t now, bool p1, bool p2) {
 }
 void handleRunning(uint32_t now, bool pressed) {
   // Como el original, solo GO detiene la carrera; READY puede caer al arrancar segun el modulo.
-  if (!Hardware::go() || pressed) stop(Reason::Request, F("Parada solicitada."));
+  if (pressed) gestureSkip = true; // Soltar el boton de parada no rearranca.
+  if ((!autoMode && !Hardware::go()) || pressed) stop(Reason::Request, F("Parada solicitada."));
   else if (now - runAt >= MAX_RUN_MS) stop(Reason::RunLimit, F("Limite de carrera alcanzado."));
   else follow(now);
 }
-void handleStopped(uint32_t now, bool pressed) {
+void handleStopped(uint32_t now, bool pressed, Gesture g) {
   // Codigo de LEDs segun el motivo de parada.
   const bool fast = (now / 125) % 2;
   const bool slow = (now / 500) % 2;
@@ -508,7 +656,9 @@ void handleStopped(uint32_t now, bool pressed) {
     default: Hardware::leds(slow, slow, slow); break;
   }
   // Nueva carrera sin RESET, conservando calibracion (no tras limite de sesion).
-  if (pressed && reason != Reason::Session) enterSpeed();
+  if (reason == Reason::Session) return;
+  if (autoMode && g != Gesture::None) { enterReady(now); handleReady(now, g); }
+  else if (!autoMode && pressed) enterSpeed();
 }
 }
 
@@ -533,6 +683,11 @@ void setup() {
     delay(30);
     return;
   }
+  if (AUTO_START) {
+    autoMode = true;
+    enterReady(millis());
+    return;
+  }
   state = State::Color;
   Serial.println(F("SW1: linea blanca. SW2: linea negra."));
 }
@@ -542,17 +697,21 @@ void loop() {
   const uint32_t now = millis();
   const bool p1 = b1.update(Hardware::sw1(), now);
   const bool p2 = b2.update(Hardware::sw2(), now);
+  const Gesture g = readGesture();
   if (state != State::Running) pollSerial();
   if (state != State::Stopped && now >= MAX_SESSION_MS) {
     stop(Reason::Session, F("Limite de sesion: apagar y dejar enfriar."));
   }
   switch (state) {
     case State::Diagnostic: diagnostic(now, p1, p2); break;
+    case State::Ready: handleReady(now, g); break;
+    case State::Countdown: handleCountdown(now, p1 || p2); break;
     case State::Color: if (p1 || p2) calibrateStart(!p1, now); break;
-    case State::Calibration: handleCalibration(now, p1 || p2); break;
+    case State::Calibration: handleCalibration(now, autoMode ? g == Gesture::Both : p1 || p2); break;
     case State::Speed: handleSpeed(now, p1, p2); break;
     case State::Running: handleRunning(now, p1 || p2); break;
-    case State::Stopped: handleStopped(now, p1 || p2); break;
+    case State::Stopped: handleStopped(now, p1 || p2, g); break;
     case State::Locked: break;
   }
+  printBar(millis());
 }
